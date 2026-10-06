@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jev-shim"
+version = "0.1.0"
+description = "Serve a standard LLM (vLLM / llama.cpp) as a Jev-compatible decision model"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+jev-shim = "jev_shim.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
