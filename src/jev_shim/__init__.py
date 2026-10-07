@@ -4,4 +4,7 @@ from .server import (Backend, LlamaCppBackend, ShimError, answer_question,  # no
                      build_grammar, build_label_grammar, build_lines_grammar,
                      build_pick_grammar, labels_and_options, main, parse_lines, pick_answer)
 
-__version__ = "0.1.0"
+from .remote import (BedrockBackend, OpenAICompatBackend, answer_pick,  # noqa: F401,E402
+                     detect_backend_type)
+
+__version__ = "0.2.0"

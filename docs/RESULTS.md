@@ -18,7 +18,10 @@ open-items-only figure, which is the like-for-like comparison.
 | Qwen3.8-Flash-Next | community NVFP4 build (uncensored variant), MTP speculative decoding | vLLM, TP 4 + expert parallel | 4× RTX 5090 |
 | Qwen3.8-27B | NVFP4 (ModelOpt) | vLLM | 1× RTX 5090 |
 | Qwen3.8-27B | unsloth UD-Q6_K GGUF | llama.cpp (ROCm) | 1× AMD Radeon AI PRO R9700 |
+| Qwen3.8-27B | amd/Qwen3.8-27B-Quark-AWQ-MXFP4 | vLLM (ROCm) | 1× AMD Radeon AI PRO R9700 |
 | Qwen3.6-35B-A3B | RedHatAI NVFP4 | vLLM | 1× RTX 5090 |
+| Qwen3.6-35B-A3B | noctrex/Qwen3.6-35B-A3B-MXFP4_MOE-GGUF | llama.cpp (ROCm) | 1× AMD Radeon AI PRO R9700 |
+| Bedrock models | AWS-hosted | AWS Bedrock Converse, us-east-1 | — |
 
 Settings: temperature 0, thinking off unless stated, 0.3–2 s pause between requests (latency is
 measured per request and excludes the pause). Latency in the "scored" columns includes JevBench's
@@ -71,9 +74,63 @@ hundreds of output tokens per decision, which collapses the JevBench composite (
 fall below 50 and trigger its quadratic gates). It is a quality ceiling, not a competitive
 configuration against a sub-second decision model.
 
+## AMD MXFP4 vs NVIDIA NVFP4, with thinking
+
+Same prompt, full-reply grammar and scoring; logprobs mode, JSON format. "Cut" counts hard items whose
+thought hit the budget.
+
+| Model | Build | Budget | Accuracy | Hard | Cut | Intelligence (open) | Calibration | Capability | Latency p50 / p95 (raw) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Qwen3.8-27B | NVIDIA ModelOpt NVFP4, vLLM, RTX 5090 | 500 | 93.5% | 97 | 47 | 84.9 | 91.1 | 88.0 | 2.18 / 6.96 s |
+| | AMD Quark AWQ MXFP4, vLLM, R9700 | 500 | 93.1% | 96 | 50 | 84.3 | 89.2 | 86.8 | 6.57 / 32.2 s |
+| | NVIDIA ModelOpt NVFP4, vLLM, RTX 5090 | 1000 | 95.2% | 101 | 25 | 89.4 | 93.3 | 91.3 | 2.78 / 13.2 s |
+| | AMD Quark AWQ MXFP4, vLLM, R9700 | 1000 | 96.1% | 103 | 22 | 87.0 | 93.7 | 90.4 | 7.83 / 60.5 s |
+| Qwen3.6-35B-A3B | NVIDIA RedHatAI NVFP4, vLLM, RTX 5090 | 500 | 89.6% | 87 | 90 | 79.1 | 86.1 | 82.6 | 1.33 / 2.90 s |
+| | AMD MXFP4_MOE GGUF, llama.cpp, R9700 | 500 | 90.5% | 90 | 79 | 77.0 | 85.5 | 81.3 | 5.37 / 11.7 s |
+| | NVIDIA RedHatAI NVFP4, vLLM, RTX 5090 | 1000 | 90.9% | 90 | 65 | 85.3 | 87.7 | 86.5 | 1.90 / 5.34 s |
+| | AMD MXFP4_MOE GGUF, llama.cpp, R9700 | 1000 | 93.1% | 96 | 60 | 84.6 | 89.6 | 87.1 | 9.09 / 21.2 s |
+
+Accuracy is equal within noise for the 27B (±2 items) and slightly favours the AMD build for the 35B
+(+2 and +5 items, which also changes backend). v1.5-style Intelligence is 1–2 points higher on the
+NVIDIA builds at most budgets. The AMD builds are 3–5× slower: the startup probe measured ~31 tok/s
+(27B) and ~42 tok/s (35B) single-stream on the R9700, against ~70–75 tok/s for the 27B on an RTX 5090,
+and with thinking, generation speed dominates latency.
+
+## AWS Bedrock (one-hot answers)
+
+All 231 public items, one request at a time, from a home connection to us-east-1 (latency includes the
+network round trip, as for Jev's hosted API). Bedrock exposes no logprobs, so every answer is one-hot
+and Calibration is not reported. Cost uses Bedrock on-demand list prices and measured tokens.
+
+| Model | Constraint | Accuracy | Original | Easy | Hard | Yes/no | Choice | Score | Intelligence (open) | Latency p50 / p95 | $ per 1k |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| Claude Haiku 4.5 | forced tool | **87.9%** | 71/72 | 48/48 | **84/111** | 65/74 | 123/139 | 15/18 | **74.5** | 0.64 / 0.79 s | $1.620 |
+| Claude Haiku 4.5 | native JSON schema | 86.1% | 71/72 | 48/48 | 80/111 | 62/74 | 123/139 | 14/18 | 69.6 | 1.29 / 1.90 s | $1.005 |
+| Qwen3 Next 80B A3B | native JSON schema | 83.1% | 69/72 | 48/48 | 75/111 | 61/74 | 117/139 | 14/18 | 65.7 | 0.37 / 0.82 s | $0.115 |
+| DeepSeek V3.2 | native JSON schema | 82.3% | 68/72 | 48/48 | 74/111 | 58/74 | 118/139 | 14/18 | 64.3 | 0.49 / 1.99 s | $0.451 |
+| Qwen3 32B | native JSON schema | 81.4% | 69/72 | 48/48 | 71/111 | 61/74 | 114/139 | 13/18 | 58.9 | 0.28 / 0.56 s | $0.117 |
+| Qwen3 Next 80B A3B | tool choice any | 81.0% | 68/72 | 48/48 | 71/111 | 57/74 | 116/139 | 14/18 | 62.4 | 0.55 / 1.26 s | $0.153 |
+| Ministral 3 14B | forced tool | 80.1% | 67/72 | 48/48 | 70/111 | 58/74 | 114/139 | 13/18 | 52.3 | 0.26 / 0.76 s | $0.168 |
+| Qwen3 32B | tool choice any | 79.2% | 70/72 | 48/48 | 65/111 | 60/74 | 109/139 | 14/18 | 57.7 | 0.39 / 0.68 s | $0.152 |
+| Ministral 3 14B | native JSON schema | 79.2% | 68/72 | 48/48 | 67/111 | 56/74 | 114/139 | 13/18 | 50.7 | 0.24 / 0.93 s | $0.151 |
+| Nova Micro | forced tool (no native support) | 70.6% | 66/72 | 48/48 | 49/111 | 51/74 | 99/139 | 13/18 | 45.7 | 0.30 / 0.39 s | $0.043 |
+
+- Native JSON-schema output helped the Qwen models (about +2 points, and faster); Claude Haiku 4.5 was
+  better and twice as fast with a forced tool call.
+- DeepSeek V3.2 accepts a forced tool choice but answers in plain text instead of calling the tool; the
+  shim refuses those answers. It works with native JSON-schema output.
+- Llama 4 Scout supports neither native structured output nor forced/any tool choice, so the shim
+  refuses to run it.
+- One-hot answers never fall in v1.5's 0.2–0.8 yes/no abstention band, which flatters Intelligence
+  slightly relative to logit-based systems.
+- Claude Haiku 4.5's price ($1 / $5 per M) is its published Bedrock list price; the others come from the
+  AWS price list.
+
 ## Quantization / backend: Qwen3.8-27B NVFP4 (vLLM, RTX 5090) vs UD-Q6_K (llama.cpp, R9700)
 
-Same scoring method on both. Accuracy is within a few items; the 5090 build is 5–9× faster.
+No thinking. At the time, the llama.cpp path read a raw top-200 instead of grammar-masked
+probabilities (masking via `post_sampling_probs` came later). Accuracy is within a few items; the 5090
+build is 5–9× faster.
 
 | Configuration | UD-Q6_K, llama.cpp | NVFP4, vLLM | Same answer | Latency p50 / p95 |
 |---|---|---|---:|---|
@@ -89,6 +146,9 @@ Same scoring method on both. Accuracy is within a few items; the 5090 build is 5
   numbers cluster at round values.
 - **Keep a JSON answer frame in logprobs mode.** Bare-label answers lost 4–6 points of accuracy on
   every model; the frame commits the model to answering.
+- **Probe, then hold.** A startup probe of every setting caught a vLLM quirk (masked-out tokens are
+  reported at a −9999 sentinel rather than omitted) that would otherwise have silently pushed the shim
+  into slow grammar mode, and caught DeepSeek V3.2 on Bedrock ignoring a forced tool choice.
 - **Send the grammar to the server at every scoring step.** Reading raw top-k logprobs and
   renormalizing afterwards is mathematically equivalent, but on hard items the top 20 fill up with
   "Let", "To", … and the options fall out, forcing slow fallbacks. Server-side masking removed them.
@@ -119,5 +179,7 @@ public provider prices found instead:
 ## Not measured
 
 - Flash-Next with the final longest-match scoring (JSON logprobs) and with thinking budgets.
+- OpenAI-compatible hosted providers (the API-logprobs tier was tested against vLLM's OpenAI-compatible
+  API only).
 - The judge tier and sealed items (not public).
 - Concurrency/throughput: JevBench measures one request at a time.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Jev-compatible decision-model shim for standard LLMs served by vLLM or llama.cpp.
+"""Jev-compatible decision-model shim for standard LLMs: vLLM, llama.cpp, OpenAI-compatible APIs, AWS Bedrock.
 
 Exposes TypeSafe's native decision interface (POST /v1/systemone), so JevBench's
 stock `typesafe` adapter, or any Jev client, can drive an ordinary instruct model:
@@ -296,6 +296,9 @@ _HOW_LABEL_LINES = {
 
 # ─── backend calls + answer shaping ───────────────────────────────────────
 
+MASKED_OUT = -1000.0   # logprobs at or below this are grammar-masked sentinels, not probabilities
+
+
 class Backend:
     def __init__(self, base_url: str, model: str, timeout_s: float, max_tokens: int):
         self.base_url = base_url.rstrip("/")
@@ -362,7 +365,8 @@ class Backend:
             "logprobs": 20, "return_tokens_as_token_ids": True,
             "structured_outputs": {"grammar": grammar}})
         top = ((out.get("choices") or [{}])[0].get("logprobs") or {}).get("top_logprobs") or [{}]
-        return {int(k.split(":", 1)[1]): v for k, v in top[0].items()}, True
+        # vLLM pads the top list with masked-out tokens at a -9999 sentinel; they are not candidates
+        return {int(k.split(":", 1)[1]): v for k, v in top[0].items() if v > MASKED_OUT}, True
 
     def raw_logprobs_of(self, ids: list[int], toks: list[int]) -> list[float]:
         """Exact, unmasked logprob of each candidate token after `ids` (slow path)."""
@@ -465,11 +469,17 @@ class Backend:
 class LlamaCppBackend(Backend):
     """Same calls against llama.cpp's llama-server (/tokenize, /completion).
 
-    `n_probs` returns raw (pre-sampling) top-k probabilities. llama.cpp has no
-    prompt_logprobs, so the out-of-top-20 fallback re-asks the same branch point
-    for the top 1000; a token still missing gets the 1000th logprob, which is an
-    upper bound on its true value (counted in scoring.fallbacks either way).
+    Branch points use the grammar-masked distribution: `post_sampling_probs`
+    reports probabilities after the sampler chain, which includes the grammar,
+    and neutral sampler settings (temperature 1, no top-k/top-p/min-p, no
+    penalties) make that the plain softmax over grammar-allowed tokens. The
+    startup probe verifies this; an option missing from the top 20 is looked up
+    in the raw top-1000 for that one step (counted in scoring.fallbacks).
     """
+
+    NEUTRAL = {"temperature": 1.0, "top_k": 0, "top_p": 1.0, "min_p": 0.0, "typical_p": 1.0,
+               "repeat_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0,
+               "dry_multiplier": 0.0, "xtc_probability": 0.0}
 
     def complete(self, prompt: str, grammar: str) -> tuple[str, dict]:
         out = self._post("/completion", {
@@ -503,9 +513,19 @@ class LlamaCppBackend(Backend):
         return out.get("content", ""), out.get("tokens_predicted", 0), out.get("stop_type") == "limit"
 
     def node_top(self, ids: list[int], grammar: str) -> tuple[dict[int, float], bool]:
-        # llama.cpp reports pre-grammar probabilities, so read a wide raw top-k
-        # and let the longest-match selection play the grammar's role.
-        return self._top(ids, 200), False
+        out = self._post("/completion", {
+            "prompt": ids, "n_predict": 1, "n_probs": 20, "grammar": grammar,
+            "post_sampling_probs": True, "cache_prompt": True, "seed": 0, **self.NEUTRAL})
+        top = (out.get("completion_probabilities") or [{}])[0].get("top_probs") or []
+        cache = self.__dict__.setdefault("_tok_text", {})
+        masked = {}
+        for t in top:
+            cache.setdefault(t["id"], t["token"])
+            if t.get("prob", 0) > 0:
+                masked[t["id"]] = math.log(t["prob"])
+        if not masked:
+            raise ShimError(502, "llama.cpp returned no grammar-masked probabilities for a branch point")
+        return masked, True
 
     def raw_logprobs_of(self, ids: list[int], toks: list[int]) -> list[float]:
         top = self._top(ids, 1000)
@@ -585,6 +605,9 @@ def answer_question(backend: Backend, state, q: dict, renormalize: bool, mode: s
                     fmt: str = "json", think: int = 0) -> tuple[dict, dict]:
     if not isinstance(q, dict) or "instructions" not in q:
         raise ShimError(400, "each question needs 'type' and 'instructions'")
+    from .remote import JsonApiBackend, answer_pick  # noqa: PLC0415 (remote imports this module)
+    if isinstance(backend, JsonApiBackend):
+        return answer_pick(backend, state, q)    # JSON decision, one-hot probabilities
     if mode == "logprobs":
         return answer_logprobs(backend, state, q, fmt, think)
     qtype = q["type"]
@@ -636,6 +659,10 @@ class Handler(BaseHTTPRequestHandler):
     mode: str
     fmt: str
     think: int
+    kind: str
+    caps: dict
+    settings: dict
+    warnings: list
     pool: ThreadPoolExecutor
     quiet: bool
 
@@ -653,7 +680,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/health", "/v1/health"):
-            self._send(200, {"ok": True, "backend": self.backend.base_url, "model": self.backend.model})
+            self._send(200, {"ok": True, "backend": self.backend.base_url, "model": self.backend.model,
+                             "settings": self.settings, "warnings": self.warnings, "capabilities": self.caps})
         else:
             self._send(404, {"error": "not found"})
 
@@ -682,59 +710,99 @@ class Handler(BaseHTTPRequestHandler):
             usage["output_tokens"] = usage["completion_tokens"]
             self._send(200, {"model": self.backend.model, "answers": answers, "usage": usage,
                              "latency_s": round(time.perf_counter() - t0, 4),
-                             "runtime": {"shim": "jev_shim", "mode": self.mode, "format": self.fmt,
-                                         "think_budget": self.think,
-                                         "renormalize": self.renormalize if self.mode == "grammar" else None,
-                                         "thinking": self.think > 0}})
+                             "runtime": {"shim": "jev_shim", **self.settings,
+                                         "renormalize": self.renormalize if self.mode == "grammar" else None}})
         except ShimError as e:
             self._send(e.status, {"error": str(e)})
         except json.JSONDecodeError:
             self._send(400, {"error": "request body is not JSON"})
-
-
-def detect_model(base_url: str) -> str:
-    """First model id served by an OpenAI-compatible backend."""
-    try:
-        with urllib.request.urlopen(base_url.rstrip("/") + "/v1/models", timeout=10) as r:
-            return json.loads(r.read())["data"][0]["id"]
-    except Exception as e:  # noqa: BLE001 - surface any failure as a clear message
-        sys.exit(f"[shim] could not list models at {base_url}/v1/models ({e}); pass --model")
+        except Exception as e:  # noqa: BLE001 - never drop the connection without a response
+            self._send(502, {"error": f"{type(e).__name__}: {e}"})
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8250)
-    ap.add_argument("--backend", default="http://127.0.0.1:8000", help="inference server base URL")
-    ap.add_argument("--backend-type", choices=["vllm", "llamacpp"], default="vllm")
+    ap.add_argument("--backend", default="http://127.0.0.1:8000",
+                    help="server base URL; https://api.openai.com/v1, https://openrouter.ai/api/v1, ...; "
+                         "bedrock://<region> or https://bedrock-runtime.<region>.amazonaws.com for AWS")
+    ap.add_argument("--backend-type", choices=["auto", "vllm", "llamacpp", "openai", "bedrock"], default="auto",
+                    help="auto: detect from the URL and the server's endpoints")
     ap.add_argument("--model", default="",
-                    help="served model name (vLLM); default: the first model the backend lists")
+                    help="model name / Bedrock model id; default: the first model the backend lists")
+    ap.add_argument("--api-key-env", default="OPENAI_API_KEY",
+                    help="environment variable holding the API key for OpenAI-compatible APIs")
+    ap.add_argument("--request-options", default="",
+                    help='extra JSON body fields for OpenAI-compatible APIs, e.g. \'{"reasoning_effort": "low"}\'')
     ap.add_argument("--timeout-s", type=float, default=300.0)
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--workers", type=int, default=8, help="concurrent backend calls")
-    ap.add_argument("--mode", choices=["logprobs", "grammar"], default="logprobs",
-                    help="logprobs: native label probabilities; grammar: model-written JSON under GBNF")
+    ap.add_argument("--mode", choices=["auto", "logprobs", "grammar", "pick"], default="auto",
+                    help="logprobs: probabilities from logits; grammar: model-written probabilities; "
+                         "pick: JSON decision with one-hot probabilities. auto: best the server supports")
+    ap.add_argument("--constraint", default="auto",
+                    choices=["auto", "gbnf", "json_schema", "json_object", "forced_tool", "any_tool"],
+                    help="how output is constrained (local: gbnf; OpenAI-compatible: json_schema|json_object; "
+                         "Bedrock: json_schema|forced_tool|any_tool). auto: strongest the server supports")
     ap.add_argument("--think-budget", dest="think", type=int, default=0,
                     help="tokens of free thinking before the grammar-constrained answer (0 = none); "
                          f"if the budget runs out the thought is cut and '{THINK_CUT_TEXT}' appended")
-    ap.add_argument("--format", dest="fmt", choices=["json", "label"], default="json",
+    ap.add_argument("--format", dest="fmt", choices=["auto", "json", "label"], default="auto",
                     help="what the model writes: Jev JSON, or just the decision (shim builds the JSON)")
     ap.add_argument("--no-renormalize", dest="renormalize", action="store_false")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
 
-    model = a.model or (detect_model(a.backend) if a.backend_type == "vllm" else "llama.cpp")
-    Handler.backend = (LlamaCppBackend if a.backend_type == "llamacpp" else Backend)(
-        a.backend, model, a.timeout_s, a.max_tokens)
+    from .capabilities import probe, resolve  # noqa: PLC0415
+    from .remote import BedrockBackend, OpenAICompatBackend, detect_backend_type, first_model  # noqa: PLC0415
+    api_key = os.environ.get(a.api_key_env, "")
+    detected = detect_backend_type(a.backend, api_key)
+    kind = detected if a.backend_type == "auto" else a.backend_type
+    # an explicit backend type must match the server (any OpenAI-style server may be driven as "openai")
+    if a.backend_type != "auto" and not (kind == detected or (kind == "openai" and detected in ("vllm", "llamacpp"))):
+        raise SystemExit(f"[shim] refusing to start: --backend-type {kind} but {a.backend} is a {detected} server")
+    if kind == "bedrock":
+        model = a.model
+        backend = BedrockBackend(a.backend, model, a.timeout_s, a.max_tokens)
+    elif kind == "openai":
+        model = a.model or first_model(a.backend, api_key)
+        backend = OpenAICompatBackend(a.backend, model, a.timeout_s, a.max_tokens, a.api_key_env,
+                                      json.loads(a.request_options) if a.request_options else None)
+    elif kind == "llamacpp":
+        model = a.model or first_model(a.backend)
+        backend = LlamaCppBackend(a.backend, model, a.timeout_s, a.max_tokens)
+    else:
+        model = a.model or first_model(a.backend)
+        backend = Backend(a.backend, model, a.timeout_s, a.max_tokens)
+
+    print(f"[shim] probing {kind} at {a.backend} ({model}) ...", flush=True)
+    caps = probe(kind, backend)
+    for name, result in caps.checks.items():
+        print(f"[shim]   {name:28s} {result}", flush=True)
+    settings, warnings = resolve(caps, a.mode, a.fmt, a.think, a.constraint)
+    for w in warnings:
+        print(f"[shim] WARNING: {w}", flush=True)
+    if kind == "openai":
+        backend.configure(settings.constraint, settings.mode == "logprobs")
+    elif kind == "bedrock":
+        backend.configure(settings.constraint)
+
+    Handler.backend = backend
+    Handler.kind = kind
+    Handler.caps = caps.as_dict()
+    Handler.settings = settings.as_dict()
+    Handler.warnings = warnings
     Handler.renormalize = a.renormalize
-    Handler.mode = a.mode
-    Handler.fmt = a.fmt
-    Handler.think = a.think
+    Handler.mode = settings.mode
+    Handler.fmt = settings.fmt
+    Handler.think = settings.think
     Handler.pool = ThreadPoolExecutor(max_workers=a.workers)
     Handler.quiet = a.quiet
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
-    print(f"[shim] http://{a.host}:{a.port}/v1/systemone -> {a.backend} ({model}), "
-          f"mode={a.mode}, format={a.fmt}, think={a.think}" + (f", renormalize={a.renormalize}" if a.mode == "grammar" else ""), flush=True)
+    print(f"[shim] http://{a.host}:{a.port}/v1/systemone -> {a.backend} [{kind}] ({model}); settings held "
+          f"for this run: " + ", ".join(f"{k}={v}" for k, v in settings.as_dict().items()
+                                        if k not in ("backend", "model")), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
